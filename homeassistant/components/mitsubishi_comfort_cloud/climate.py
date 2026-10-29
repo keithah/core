@@ -55,12 +55,6 @@ _LIB_MODE_TO_HVAC: dict[Mode, HVACMode] = {v: k for k, v in _HVAC_TO_MODE.items(
 _FAN_SPEED_MAP: dict[str, FanSpeed] = {s.value: s for s in FanSpeed}
 _VANE_DIR_MAP: dict[str, VaneDirection] = {d.value: d for d in VaneDirection}
 
-_OPT_MODE = "mode"
-_OPT_COOL_SETPOINT = "cool_setpoint"
-_OPT_HEAT_SETPOINT = "heat_setpoint"
-_OPT_FAN_SPEED = "fan_speed"
-_OPT_VANE_DIRECTION = "vane_direction"
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -86,30 +80,26 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
         """Initialize."""
         super().__init__(coordinator)
         self._attr_unique_id = self._device.serial
-        self._optimistic: dict[str, Any] = {}
+        self._command_mode: str | None = None
 
     @override
     def _handle_coordinator_update(self) -> None:
-        """Clear optimistic state when real data arrives from device."""
-        self._optimistic.clear()
+        """Reset command routing when the coordinator updates."""
+        self._command_mode = None
         super()._handle_coordinator_update()
-
-    @property
-    def _effective_mode(self) -> str | None:
-        return self._optimistic.get(_OPT_MODE, self._device.status.mode)
 
     @property
     @override
     def hvac_mode(self) -> HVACMode | None:
         """Return the current HVAC mode."""
-        mode = self._effective_mode
+        mode = self._device.status.mode
         return _MODE_TO_HVAC.get(mode) if mode else None
 
     @property
     @override
     def hvac_action(self) -> HVACAction | None:
         """Return the current HVAC action."""
-        return HVACAction.OFF if self._effective_mode == "off" else None
+        return HVACAction.OFF if self._device.status.mode == "off" else None
 
     @property
     @override
@@ -137,42 +127,34 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
     @override
     def native_target_temperature(self) -> float | None:
         """Return the target temperature."""
-        mode = self._effective_mode
+        mode = self._device.status.mode
         if mode in ("cool", "autoCool"):
-            return self._optimistic.get(
-                _OPT_COOL_SETPOINT, self._device.status.cool_setpoint
-            )
+            return self._device.status.cool_setpoint
         if mode in ("heat", "autoHeat"):
-            return self._optimistic.get(
-                _OPT_HEAT_SETPOINT, self._device.status.heat_setpoint
-            )
+            return self._device.status.heat_setpoint
         return None
 
     @property
     @override
     def native_target_temperature_high(self) -> float | None:
         """Return the upper bound target temperature."""
-        if self._effective_mode in ("auto", "autoCool", "autoHeat"):
-            return self._optimistic.get(
-                _OPT_COOL_SETPOINT, self._device.status.cool_setpoint
-            )
+        if self._device.status.mode in ("auto", "autoCool", "autoHeat"):
+            return self._device.status.cool_setpoint
         return None
 
     @property
     @override
     def native_target_temperature_low(self) -> float | None:
         """Return the lower bound target temperature."""
-        if self._effective_mode in ("auto", "autoCool", "autoHeat"):
-            return self._optimistic.get(
-                _OPT_HEAT_SETPOINT, self._device.status.heat_setpoint
-            )
+        if self._device.status.mode in ("auto", "autoCool", "autoHeat"):
+            return self._device.status.heat_setpoint
         return None
 
     @property
     @override
     def fan_mode(self) -> str | None:
         """Return the current fan mode."""
-        return self._optimistic.get(_OPT_FAN_SPEED, self._device.status.fan_speed)
+        return self._device.status.fan_speed
 
     @property
     @override
@@ -184,9 +166,7 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
     @override
     def swing_mode(self) -> str | None:
         """Return the current swing mode."""
-        return self._optimistic.get(
-            _OPT_VANE_DIRECTION, self._device.status.vane_direction
-        )
+        return self._device.status.vane_direction
 
     @property
     @override
@@ -262,36 +242,29 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
         result = await self.coordinator.async_command(self._device.set_mode(lib_mode))
         if not result.success:
             self._command_failed("set_hvac_mode_failed")
-        self._optimistic[_OPT_MODE] = result.value
-        self.async_write_ha_state()
+        # Keep accepted command intent separate from reported state.
+        self._command_mode = result.value
 
     @override
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set the target temperature."""
         if ATTR_HVAC_MODE in kwargs:
             await self.async_handle_set_hvac_mode_service(kwargs[ATTR_HVAC_MODE])
-        mode = self._effective_mode
-        wrote = False
+        mode = self._command_mode or self._device.status.mode
         failed = False
 
         if ATTR_TARGET_TEMP_HIGH in kwargs:
             result = await self.coordinator.async_command(
                 self._device.set_cool_setpoint(kwargs[ATTR_TARGET_TEMP_HIGH])
             )
-            if result.success:
-                self._optimistic[_OPT_COOL_SETPOINT] = result.value
-                wrote = True
-            else:
+            if not result.success:
                 failed = True
 
         if ATTR_TARGET_TEMP_LOW in kwargs:
             result = await self.coordinator.async_command(
                 self._device.set_heat_setpoint(kwargs[ATTR_TARGET_TEMP_LOW])
             )
-            if result.success:
-                self._optimistic[_OPT_HEAT_SETPOINT] = result.value
-                wrote = True
-            else:
+            if not result.success:
                 failed = True
 
         temp = kwargs.get(ATTR_TEMPERATURE)
@@ -300,19 +273,13 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
                 result = await self.coordinator.async_command(
                     self._device.set_cool_setpoint(temp)
                 )
-                if result.success:
-                    self._optimistic[_OPT_COOL_SETPOINT] = result.value
-                    wrote = True
-                else:
+                if not result.success:
                     failed = True
             elif mode in ("heat", "autoHeat"):
                 result = await self.coordinator.async_command(
                     self._device.set_heat_setpoint(temp)
                 )
-                if result.success:
-                    self._optimistic[_OPT_HEAT_SETPOINT] = result.value
-                    wrote = True
-                else:
+                if not result.success:
                     failed = True
             else:
                 _LOGGER.debug(
@@ -321,9 +288,6 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
                     mode,
                 )
 
-        # Apply whatever succeeded before surfacing the failure to the user.
-        if wrote:
-            self.async_write_ha_state()
         if failed:
             self._command_failed("set_temperature_failed")
 
@@ -337,8 +301,6 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
         result = await self.coordinator.async_command(self._device.set_fan_speed(speed))
         if not result.success:
             self._command_failed("set_fan_mode_failed")
-        self._optimistic[_OPT_FAN_SPEED] = result.value
-        self.async_write_ha_state()
 
     @override
     async def async_set_swing_mode(self, swing_mode: str) -> None:
@@ -352,10 +314,17 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
         )
         if not result.success:
             self._command_failed("set_swing_mode_failed")
-        self._optimistic[_OPT_VANE_DIRECTION] = result.value
-        self.async_write_ha_state()
 
     @override
     async def async_turn_off(self) -> None:
         """Turn the entity off."""
         await self.async_set_hvac_mode(HVACMode.OFF)
+
+    @override
+    async def async_toggle(self) -> None:
+        """Toggle using the last accepted command or reported mode."""
+        mode = self._command_mode or self._device.status.mode
+        if mode == "off":
+            await self.async_turn_on()
+        else:
+            await self.async_turn_off()
