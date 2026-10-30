@@ -1,5 +1,7 @@
 """Tests for Mitsubishi Comfort Cloud climate entities."""
 
+from datetime import timedelta
+from typing import Any
 from unittest.mock import AsyncMock, call
 
 from freezegun.api import FrozenDateTimeFactory
@@ -25,7 +27,7 @@ from homeassistant.components.mitsubishi_comfort_cloud.const import (
 )
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, STATE_UNAVAILABLE
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from .conftest import MOCK_SERIAL
@@ -33,15 +35,53 @@ from .conftest import MOCK_SERIAL
 ENTITY_ID = "climate.living_room"
 
 
-async def _refresh(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
+async def _refresh(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    interval: int | None = None,
+) -> None:
     """Refresh the reported cloud state on the polling interval."""
-    freezer.tick(DEFAULT_SCAN_INTERVAL)
+    freezer.tick(
+        DEFAULT_SCAN_INTERVAL if interval is None else timedelta(seconds=interval)
+    )
     async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
 
+def _reported_state(state: State) -> tuple[str, dict[str, Any]]:
+    """Return climate values without command-status attributes."""
+    attributes = dict(state.attributes)
+    attributes.pop("command_status", None)
+    attributes.pop("pending_commands", None)
+    attributes.pop("unconfirmed_commands", None)
+    return state.state, attributes
+
+
+def _pending_commands_from(
+    commands: list[dict[str, str | float]],
+) -> dict[str, str | float]:
+    """Map cloud fields to the pending command attribute names."""
+    pending_keys = {
+        "operationMode": "mode",
+        "spCool": "cool_setpoint",
+        "spHeat": "heat_setpoint",
+    }
+    return {
+        pending_keys[field]: value
+        for command in commands
+        for field, value in command.items()
+    }
+
+
 @pytest.mark.parametrize(
-    ("service", "data", "command", "expected_mode", "expected_attributes"),
+    (
+        "service",
+        "data",
+        "command",
+        "expected_mode",
+        "expected_attributes",
+        "expected_pending_commands",
+    ),
     [
         pytest.param(
             "set_hvac_mode",
@@ -49,6 +89,7 @@ async def _refresh(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
             {"operationMode": "heat"},
             HVACMode.HEAT,
             {ATTR_TEMPERATURE: 21.0},
+            {"mode": "heat"},
             id="mode",
         ),
         pytest.param(
@@ -57,6 +98,7 @@ async def _refresh(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
             {"spCool": 25.0},
             HVACMode.COOL,
             {ATTR_TEMPERATURE: 25.0},
+            {"cool_setpoint": 25.0},
             id="temperature",
         ),
         pytest.param(
@@ -65,6 +107,7 @@ async def _refresh(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
             {"fanSpeed": "low"},
             HVACMode.COOL,
             {ATTR_FAN_MODE: "low"},
+            {"fan_speed": "low"},
             id="fan",
         ),
         pytest.param(
@@ -73,6 +116,7 @@ async def _refresh(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
             {"airDirection": "swing"},
             HVACMode.COOL,
             {ATTR_SWING_MODE: "swing"},
+            {"vane_direction": "swing"},
             id="vane",
         ),
         pytest.param(
@@ -81,6 +125,7 @@ async def _refresh(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
             {"operationMode": "off"},
             HVACMode.OFF,
             {ATTR_TEMPERATURE: None, "hvac_action": "off"},
+            {"mode": "off"},
             id="off",
         ),
     ],
@@ -95,6 +140,7 @@ async def test_cloud_commands(
     command: dict[str, str | float],
     expected_mode: HVACMode,
     expected_attributes: dict[str, str | float | None],
+    expected_pending_commands: dict[str, str | float],
 ) -> None:
     """Accepted cloud commands only change displayed state after confirmation."""
     mock_cloud_account.get_device_profile.return_value["hasVaneSwing"] = True
@@ -111,13 +157,15 @@ async def test_cloud_commands(
     )
     mock_cloud_account.send_command.assert_awaited_once_with(MOCK_SERIAL, command)
     state = hass.states.get(ENTITY_ID)
-    assert state.state == before.state
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    assert state.attributes["pending_commands"] == expected_pending_commands
+    assert state.attributes["command_status"] == "pending"
 
     await _refresh(hass, freezer)
     state = hass.states.get(ENTITY_ID)
-    assert state.state == before.state
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    assert state.attributes["pending_commands"] == expected_pending_commands
+    assert state.attributes["command_status"] == "pending"
 
     mock_cloud_account.get_device_details.return_value.update(command)
     await _refresh(hass, freezer)
@@ -125,6 +173,144 @@ async def test_cloud_commands(
     assert state.state == expected_mode
     for attribute, value in expected_attributes.items():
         assert state.attributes[attribute] == value
+    assert state.attributes["pending_commands"] == {}
+    assert state.attributes["command_status"] == "reported"
+
+
+async def test_cloud_command_polling_uses_backoff(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_cloud_account: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Accepted commands poll quickly, then return to normal cadence."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = next(iter(mock_config_entry.runtime_data.values()))
+
+    await hass.services.async_call(
+        CLIMATE_DOMAIN,
+        "set_fan_mode",
+        {ATTR_ENTITY_ID: ENTITY_ID, ATTR_FAN_MODE: "low"},
+        blocking=True,
+    )
+    assert coordinator.update_interval == timedelta(seconds=1)
+
+    for interval, next_interval in zip(
+        (1, 2, 4, 8, 16),
+        (2, 4, 8, 16, int(DEFAULT_SCAN_INTERVAL.total_seconds())),
+        strict=True,
+    ):
+        await _refresh(hass, freezer, interval)
+        assert coordinator.update_interval == timedelta(seconds=next_interval)
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.attributes["command_status"] == "unconfirmed"
+    assert state.attributes["pending_commands"] == {}
+    assert state.attributes["unconfirmed_commands"] == {"fan_speed": "low"}
+
+    mock_cloud_account.get_device_details.return_value["fanSpeed"] = "low"
+    await _refresh(hass, freezer)
+    state = hass.states.get(ENTITY_ID)
+    assert state.attributes["command_status"] == "reported"
+    assert state.attributes["pending_commands"] == {}
+    assert state.attributes["unconfirmed_commands"] == {}
+
+
+async def test_cloud_command_polling_stops_when_reported(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_cloud_account: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Stop accelerated polling as soon as the command is reported."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = next(iter(mock_config_entry.runtime_data.values()))
+
+    await hass.services.async_call(
+        CLIMATE_DOMAIN,
+        "set_fan_mode",
+        {ATTR_ENTITY_ID: ENTITY_ID, ATTR_FAN_MODE: "low"},
+        blocking=True,
+    )
+    mock_cloud_account.get_device_details.return_value["fanSpeed"] = "low"
+
+    await _refresh(hass, freezer, 1)
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.attributes["command_status"] == "reported"
+    assert state.attributes["pending_commands"] == {}
+    assert coordinator.update_interval == DEFAULT_SCAN_INTERVAL
+
+
+async def test_cloud_command_polling_backs_off_after_failed_poll(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_cloud_account: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Continue the bounded backoff after a transient polling failure."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = next(iter(mock_config_entry.runtime_data.values()))
+
+    await hass.services.async_call(
+        CLIMATE_DOMAIN,
+        "set_fan_mode",
+        {ATTR_ENTITY_ID: ENTITY_ID, ATTR_FAN_MODE: "low"},
+        blocking=True,
+    )
+    mock_cloud_account.get_device_details.side_effect = DeviceConnectionError(
+        "temporary network failure"
+    )
+
+    await _refresh(hass, freezer, 1)
+
+    assert coordinator.update_interval == timedelta(seconds=2)
+
+    mock_cloud_account.get_device_details.side_effect = None
+    await _refresh(hass, freezer, 2)
+
+    assert coordinator.update_interval == timedelta(seconds=4)
+
+
+async def test_cloud_command_stays_pending_after_failed_poll(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_cloud_account: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A failed poll cannot confirm a command from cached device state."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        CLIMATE_DOMAIN,
+        "set_fan_mode",
+        {ATTR_ENTITY_ID: ENTITY_ID, ATTR_FAN_MODE: "auto"},
+        blocking=True,
+    )
+    mock_cloud_account.get_device_details.side_effect = DeviceConnectionError(
+        "temporary network failure"
+    )
+
+    await _refresh(hass, freezer, 1)
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.state == STATE_UNAVAILABLE
+
+    mock_cloud_account.get_device_details.side_effect = None
+    mock_cloud_account.get_device_details.return_value["fanSpeed"] = "low"
+    await _refresh(hass, freezer)
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.attributes["command_status"] == "pending"
+    assert state.attributes["pending_commands"] == {"fan_speed": "auto"}
 
 
 @pytest.mark.parametrize(
@@ -156,7 +342,7 @@ async def test_toggles_follow_accepted_mode(
     await hass.async_block_till_done()
     before = hass.states.get(ENTITY_ID)
 
-    for _ in range(2):
+    for command in commands:
         await hass.services.async_call(
             CLIMATE_DOMAIN,
             "toggle",
@@ -164,8 +350,11 @@ async def test_toggles_follow_accepted_mode(
             blocking=True,
         )
         state = hass.states.get(ENTITY_ID)
-        assert state.state == before.state
-        assert state.attributes == before.attributes
+        assert _reported_state(state) == _reported_state(before)
+        assert state.attributes["command_status"] == "pending"
+        assert state.attributes["pending_commands"] == {
+            "mode": command["operationMode"]
+        }
 
     assert mock_cloud_account.send_command.await_args_list == [
         call(MOCK_SERIAL, command) for command in commands
@@ -225,8 +414,11 @@ async def test_rejected_toggle_preserves_accepted_mode(
         call(MOCK_SERIAL, command) for command in commands
     ]
     state = hass.states.get(ENTITY_ID)
-    assert state.state == before.state
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    assert state.attributes["command_status"] == "pending"
+    assert state.attributes["pending_commands"] == {
+        "mode": commands[-1]["operationMode"]
+    }
 
 
 @pytest.mark.parametrize(
@@ -399,11 +591,17 @@ async def test_partial_temperature_failure(
         call(MOCK_SERIAL, {"spHeat": 20.0}),
     ]
     state = hass.states.get(ENTITY_ID)
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    expected_pending_commands = (
+        {"heat_setpoint": 20.0} if expected_low == 20.0 else {"cool_setpoint": 26.0}
+    )
+    assert state.attributes["pending_commands"] == expected_pending_commands
+    assert state.attributes["command_status"] == "pending"
 
     await _refresh(hass, freezer)
     state = hass.states.get(ENTITY_ID)
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    assert state.attributes["pending_commands"] == expected_pending_commands
 
     mock_cloud_account.get_device_details.return_value.update(
         spHeat=expected_low, spCool=expected_high
@@ -412,6 +610,8 @@ async def test_partial_temperature_failure(
     state = hass.states.get(ENTITY_ID)
     assert state.attributes["target_temp_low"] == expected_low
     assert state.attributes["target_temp_high"] == expected_high
+    assert state.attributes["command_status"] == "reported"
+    assert state.attributes["pending_commands"] == {}
 
 
 async def test_poll_replaces_pending_command_mode(
@@ -431,9 +631,11 @@ async def test_poll_replaces_pending_command_mode(
         blocking=True,
     )
     assert hass.states.get(ENTITY_ID).state == "cool"
+    assert hass.states.get(ENTITY_ID).attributes["pending_commands"] == {"mode": "heat"}
     await _refresh(hass, freezer)
     assert hass.states.get(ENTITY_ID).state == "cool"
     assert mock_cloud_account.get_device_details.await_count == 2
+    assert hass.states.get(ENTITY_ID).attributes["pending_commands"] == {"mode": "heat"}
     await hass.services.async_call(
         CLIMATE_DOMAIN,
         "set_temperature",
@@ -444,6 +646,10 @@ async def test_poll_replaces_pending_command_mode(
         call(MOCK_SERIAL, {"operationMode": "heat"}),
         call(MOCK_SERIAL, {"spCool": 25.0}),
     ]
+    assert hass.states.get(ENTITY_ID).attributes["pending_commands"] == {
+        "mode": "heat",
+        "cool_setpoint": 25.0,
+    }
 
 
 @pytest.mark.parametrize("mode", ["off", "heat", "auto", "dry"])
@@ -582,13 +788,17 @@ async def test_combined_mode_temperature(
         call(MOCK_SERIAL, command) for command in commands
     ]
     state = hass.states.get(ENTITY_ID)
-    assert state.state == before.state
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    assert state.attributes["pending_commands"] == _pending_commands_from(commands)
+    assert state.attributes["command_status"] == "pending"
 
     for command in commands:
         mock_cloud_account.get_device_details.return_value.update(command)
     await _refresh(hass, freezer)
-    assert hass.states.get(ENTITY_ID).state == expected_mode
+    state = hass.states.get(ENTITY_ID)
+    assert state.state == expected_mode
+    assert state.attributes["command_status"] == "reported"
+    assert state.attributes["pending_commands"] == {}
 
 
 @pytest.mark.parametrize(
@@ -632,8 +842,12 @@ async def test_temperature_follows_accepted_mode(
         call(MOCK_SERIAL, {setpoint_field: temperature}),
     ]
     state = hass.states.get(ENTITY_ID)
-    assert state.state == before.state
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    assert state.attributes["pending_commands"] == {
+        "mode": requested_mode.value,
+        "heat_setpoint" if setpoint_field == "spHeat" else "cool_setpoint": temperature,
+    }
+    assert state.attributes["command_status"] == "pending"
 
 
 async def test_rejected_mode_preserves_pending_temperature_routing(
@@ -673,8 +887,12 @@ async def test_rejected_mode_preserves_pending_temperature_routing(
         call(MOCK_SERIAL, {"spHeat": 16.0}),
     ]
     state = hass.states.get(ENTITY_ID)
-    assert state.state == before.state
-    assert state.attributes == before.attributes
+    assert _reported_state(state) == _reported_state(before)
+    assert state.attributes["pending_commands"] == {
+        "mode": "heat",
+        "heat_setpoint": 16.0,
+    }
+    assert state.attributes["command_status"] == "pending"
 
 
 @pytest.mark.parametrize(

@@ -55,6 +55,12 @@ _LIB_MODE_TO_HVAC: dict[Mode, HVACMode] = {v: k for k, v in _HVAC_TO_MODE.items(
 _FAN_SPEED_MAP: dict[str, FanSpeed] = {s.value: s for s in FanSpeed}
 _VANE_DIR_MAP: dict[str, VaneDirection] = {d.value: d for d in VaneDirection}
 
+_OPT_MODE = "mode"
+_OPT_COOL_SETPOINT = "cool_setpoint"
+_OPT_HEAT_SETPOINT = "heat_setpoint"
+_OPT_FAN_SPEED = "fan_speed"
+_OPT_VANE_DIRECTION = "vane_direction"
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -81,12 +87,63 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
         super().__init__(coordinator)
         self._attr_unique_id = self._device.serial
         self._command_mode: str | None = None
+        self._pending_commands: dict[str, Any] = {}
+        self._unconfirmed_commands: dict[str, Any] = {}
 
     @override
     def _handle_coordinator_update(self) -> None:
-        """Reset command routing when the coordinator updates."""
+        """Clear confirmed commands and reset command routing after polling."""
+        if not self.coordinator.last_update_success:
+            super()._handle_coordinator_update()
+            return
+        had_pending_commands = bool(self._pending_commands)
+        status = self._device.status
+        reported = {
+            _OPT_MODE: status.mode,
+            _OPT_COOL_SETPOINT: status.cool_setpoint,
+            _OPT_HEAT_SETPOINT: status.heat_setpoint,
+            _OPT_FAN_SPEED: status.fan_speed,
+            _OPT_VANE_DIRECTION: status.vane_direction,
+        }
+        for commands in (self._pending_commands, self._unconfirmed_commands):
+            for key, value in list(commands.items()):
+                matches = reported[key] == value
+                if key == _OPT_MODE:
+                    matches = _MODE_TO_HVAC.get(reported[key]) == _MODE_TO_HVAC.get(
+                        value
+                    )
+                if matches:
+                    commands.pop(key)
+        if not self.coordinator.command_confirmation_active:
+            self._unconfirmed_commands.update(self._pending_commands)
+            self._pending_commands.clear()
+        if had_pending_commands and not self._pending_commands:
+            self.coordinator.async_stop_command_polling()
         self._command_mode = None
         super()._handle_coordinator_update()
+
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose pending and unconfirmed command targets separately."""
+        return {
+            "pending_commands": dict(self._pending_commands),
+            "unconfirmed_commands": dict(self._unconfirmed_commands),
+            "command_status": (
+                "pending"
+                if self._pending_commands
+                else "unconfirmed"
+                if self._unconfirmed_commands
+                else "reported"
+            ),
+        }
+
+    def _set_pending_command(self, key: str, value: Any) -> None:
+        """Expose accepted intent and start fast device confirmation polling."""
+        self._pending_commands[key] = value
+        self._unconfirmed_commands.pop(key, None)
+        self.coordinator.async_command_accepted()
+        self.async_write_ha_state()
 
     @property
     @override
@@ -244,6 +301,7 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
             self._command_failed("set_hvac_mode_failed")
         # Keep accepted command intent separate from reported state.
         self._command_mode = result.value
+        self._set_pending_command(_OPT_MODE, result.value)
 
     @override
     async def async_set_temperature(self, **kwargs: Any) -> None:
@@ -257,14 +315,18 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
             result = await self.coordinator.async_command(
                 self._device.set_cool_setpoint(kwargs[ATTR_TARGET_TEMP_HIGH])
             )
-            if not result.success:
+            if result.success:
+                self._set_pending_command(_OPT_COOL_SETPOINT, result.value)
+            else:
                 failed = True
 
         if ATTR_TARGET_TEMP_LOW in kwargs:
             result = await self.coordinator.async_command(
                 self._device.set_heat_setpoint(kwargs[ATTR_TARGET_TEMP_LOW])
             )
-            if not result.success:
+            if result.success:
+                self._set_pending_command(_OPT_HEAT_SETPOINT, result.value)
+            else:
                 failed = True
 
         temp = kwargs.get(ATTR_TEMPERATURE)
@@ -273,13 +335,17 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
                 result = await self.coordinator.async_command(
                     self._device.set_cool_setpoint(temp)
                 )
-                if not result.success:
+                if result.success:
+                    self._set_pending_command(_OPT_COOL_SETPOINT, result.value)
+                else:
                     failed = True
             elif mode in ("heat", "autoHeat"):
                 result = await self.coordinator.async_command(
                     self._device.set_heat_setpoint(temp)
                 )
-                if not result.success:
+                if result.success:
+                    self._set_pending_command(_OPT_HEAT_SETPOINT, result.value)
+                else:
                     failed = True
             else:
                 _LOGGER.debug(
@@ -301,6 +367,7 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
         result = await self.coordinator.async_command(self._device.set_fan_speed(speed))
         if not result.success:
             self._command_failed("set_fan_mode_failed")
+        self._set_pending_command(_OPT_FAN_SPEED, result.value)
 
     @override
     async def async_set_swing_mode(self, swing_mode: str) -> None:
@@ -314,6 +381,7 @@ class MitsubishiComfortCloudClimate(MitsubishiComfortCloudEntity, ClimateEntity)
         )
         if not result.success:
             self._command_failed("set_swing_mode_failed")
+        self._set_pending_command(_OPT_VANE_DIRECTION, result.value)
 
     @override
     async def async_turn_off(self) -> None:
